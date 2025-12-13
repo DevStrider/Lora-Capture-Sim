@@ -21,7 +21,7 @@ N_VALUES = [500, 1000, 2000, 5000, 10_000]
 # Clustering options (fixed by description)
 C_OPTIONS = [1, 2, 4]
 
-# SA/local search tuning (you said you don't care about complexity)
+# SA/local search tuning
 RESTARTS = 6
 ITERS_PER_RESTART = 4000
 SA_START_TEMP = 0.002
@@ -32,10 +32,14 @@ SEED = 12345
 # =========================
 # Debug printing controls
 # =========================
-PRINT_SA_PROGRESS = True
-# Print SA progress at these iteration numbers (0-based):
-# first, some in-between, and last
+PRINT_SA_PROGRESS = False
 SA_PRINT_STEPS = [0, 50, 200, 500, 1000, 2000, 3000, 3999]  # keep last = ITERS_PER_RESTART-1
+
+# =========================
+# CDF plot controls
+# =========================
+CDF_PLOT_N = max(N_VALUES)     # which N to use for the CDF plot
+CDF_SCENARIOS = ["baseline", "C=1", "C=2", "C=4"]  # which scenarios to include in CDF
 
 
 # =========================
@@ -53,7 +57,7 @@ def sample_devices_uniform_disk(n: int, radius_m: float, rng: np.random.Generato
 
 def path_loss_db(d_m: np.ndarray):
     """PL(d)=40+27*log10(d_meters). Avoid log10(0)."""
-    d_safe = np.maximum(d_m, 1.0)  # 1 meter floor
+    d_safe = np.maximum(d_m, 1.0)
     return 40.0 + 27.0 * np.log10(d_safe)
 
 def compute_rx_dbm(d_m: np.ndarray):
@@ -66,16 +70,11 @@ def compute_rx_dbm(d_m: np.ndarray):
 # =========================
 @dataclass
 class Schedule:
-    t_start: np.ndarray   # shape (P,)
-    dev_id: np.ndarray    # shape (P,)
-    u_chan: np.ndarray    # shape (P,) uniform [0,1) used for channel draw
+    t_start: np.ndarray
+    dev_id: np.ndarray
+    u_chan: np.ndarray
 
 def generate_schedule(n_devices: int, total_packets: int, rng: np.random.Generator) -> Schedule:
-    """
-    Aggregate Poisson arrivals:
-      mean interarrival = 600/N seconds.
-    Each arrival chooses a random device uniformly.
-    """
     mean_iat = MEAN_IAT_PER_DEVICE / float(n_devices)
     iats = rng.exponential(scale=mean_iat, size=total_packets)
     t_start = np.cumsum(iats)
@@ -88,39 +87,27 @@ def generate_schedule(n_devices: int, total_packets: int, rng: np.random.Generat
 # Channel assignment per packet
 # =========================
 def baseline_channels(u_chan: np.ndarray) -> np.ndarray:
-    """Random among 8 channels."""
     return np.floor(u_chan * NCHANNELS).astype(np.int32)
 
 def clustered_channels(dev_id: np.ndarray, u_chan: np.ndarray, dev_cluster: np.ndarray, C: int) -> np.ndarray:
-    """
-    If C channels per cluster, there are K=8/C clusters.
-    Cluster k owns channels [k*C, ..., k*C + (C-1)].
-    Each device randomly selects one of the C channels in its cluster.
-    """
     k = dev_cluster[dev_id]
     within = np.floor(u_chan * C).astype(np.int32)
     return (k * C + within).astype(np.int32)
 
 
 # =========================
-# Core simulation (interval components per channel)
+# Core simulation (collision + capture)
 # =========================
 @dataclass
 class SimResult:
     success_count: int
-    collision_fail_count: int      # packets that failed due to collision/capture rules
-    collided_packet_count: int     # packets that experienced overlap (component size>1)
-    capture_success_count: int     # successes that happened inside collisions (0 or 1 per component)
+    collision_fail_count: int
+    collided_packet_count: int
+    capture_success_count: int
     success_prob: float
-    per_packet_success: np.ndarray # bool array shape (P,)
+    per_packet_success: np.ndarray
 
 def simulate(schedule: Schedule, rx_dbm: np.ndarray, channels: np.ndarray) -> SimResult:
-    """
-    Build per-channel packet intervals, find overlap components, apply capture rule:
-    - If component size==1 -> success
-    - Else if strongest is >= CAPTURE_DB above *every* other -> strongest success, others fail
-    - Else all fail
-    """
     P = schedule.t_start.shape[0]
     t0 = schedule.t_start
     t1 = t0 + TPACKET_S
@@ -132,17 +119,14 @@ def simulate(schedule: Schedule, rx_dbm: np.ndarray, channels: np.ndarray) -> Si
     collided_packet_count = 0
     capture_success_count = 0
 
-    # process per channel
     for ch in range(NCHANNELS):
         idx = np.where(channels == ch)[0]
         if idx.size == 0:
             continue
 
-        # sort by start time
         order = np.argsort(t0[idx])
         idx = idx[order]
 
-        # sweep to form connected components by overlap
         comp = [idx[0]]
         comp_end = t1[idx[0]]
 
@@ -154,13 +138,11 @@ def simulate(schedule: Schedule, rx_dbm: np.ndarray, channels: np.ndarray) -> Si
 
             collided_packet_count += len(comp_list)
 
-            # capture check
             comp_rx = rx[np.array(comp_list)]
             best_pos = int(np.argmax(comp_rx))
             best_idx = comp_list[best_pos]
             best_rx = comp_rx[best_pos]
 
-            # strongest must be >= 3 dB above ALL others
             ok = True
             for pkt in comp_list:
                 if pkt == best_idx:
@@ -172,10 +154,9 @@ def simulate(schedule: Schedule, rx_dbm: np.ndarray, channels: np.ndarray) -> Si
             if ok:
                 per_packet_success[best_idx] = True
                 capture_success_count += 1
-            # else none succeed
 
         for pkt in idx[1:]:
-            if t0[pkt] < comp_end:  # overlap => same component
+            if t0[pkt] < comp_end:
                 comp.append(pkt)
                 if t1[pkt] > comp_end:
                     comp_end = t1[pkt]
@@ -201,13 +182,11 @@ def simulate(schedule: Schedule, rx_dbm: np.ndarray, channels: np.ndarray) -> Si
 
 
 # =========================
-# Best clustering algorithm:
-# Stratified init + simulated annealing swap search (full 10k fitness)
+# Optimizer: stratified init + SA swaps + restarts
 # =========================
 def stratified_interleaved_order(rx_dbm: np.ndarray) -> np.ndarray:
-    """Return device indices in order: strongest, weakest, 2nd strongest, 2nd weakest, ..."""
     n = rx_dbm.size
-    order = np.argsort(rx_dbm)  # ascending
+    order = np.argsort(rx_dbm)
     lo, hi = 0, n - 1
     inter = np.empty(n, dtype=np.int32)
     k = 0
@@ -218,10 +197,6 @@ def stratified_interleaved_order(rx_dbm: np.ndarray) -> np.ndarray:
     return inter
 
 def initial_stratified_assignment(rx_dbm: np.ndarray, num_clusters: int, rng: np.random.Generator) -> np.ndarray:
-    """
-    Mix strong and weak devices across clusters while keeping cluster sizes balanced.
-    Uses a random rotation so restarts are different.
-    """
     n = rx_dbm.size
     inter = stratified_interleaved_order(rx_dbm)
     shift = int(rng.integers(0, num_clusters))
@@ -240,10 +215,6 @@ def local_swap_improve_sa(dev_cluster: np.ndarray,
                           end_temp: float = SA_END_TEMP,
                           restart_id: int = -1,
                           N_devices: int = -1) -> np.ndarray:
-    """
-    Simulated-annealing swap search, evaluated on FULL 10k packets.
-    Prints progress at SA_PRINT_STEPS + last iteration if PRINT_SA_PROGRESS=True.
-    """
     n = rx_dbm.size
 
     def fitness(dc: np.ndarray) -> float:
@@ -260,7 +231,6 @@ def local_swap_improve_sa(dev_cluster: np.ndarray,
         print(f"\n  [SA start] N={N_devices}, C={C}, restart={restart_id}, iters={iters}, init_fit={best_fit:.6f}")
 
     for t in range(iters):
-        # linear temperature schedule
         if iters > 1:
             temp = start_temp + (end_temp - start_temp) * (t / (iters - 1))
         else:
@@ -283,7 +253,7 @@ def local_swap_improve_sa(dev_cluster: np.ndarray,
             accept = True
             reason = "improve"
         elif temp > 0:
-            p = np.exp(delta / temp)  # delta < 0 => p in (0,1)
+            p = np.exp(delta / temp)
             if rng.random() < p:
                 accept = True
                 reason = "worse-accept"
@@ -294,7 +264,7 @@ def local_swap_improve_sa(dev_cluster: np.ndarray,
                 best_fit = new_fit
                 best = cur.copy()
         else:
-            cur[a], cur[b] = ca, cb  # revert
+            cur[a], cur[b] = ca, cb
 
         if PRINT_SA_PROGRESS:
             if (t in SA_PRINT_STEPS) or (t == iters - 1):
@@ -314,13 +284,6 @@ def optimize_assignment(rx_dbm: np.ndarray,
                         restarts: int = RESTARTS,
                         iters_per_restart: int = ITERS_PER_RESTART,
                         N_devices: int = -1) -> np.ndarray:
-    """
-    Multiple restarts of:
-      - stratified balanced init
-      - SA swap search
-    Keep best.
-    Prints summary per restart if PRINT_SA_PROGRESS=True.
-    """
     num_clusters = NCHANNELS // C
 
     best_dc = None
@@ -337,7 +300,6 @@ def optimize_assignment(rx_dbm: np.ndarray,
     for r in range(restarts):
         dc0 = initial_stratified_assignment(rx_dbm, num_clusters, rng)
         init_fit = fitness(dc0)
-
         if PRINT_SA_PROGRESS:
             print(f"  [restart {r+1}/{restarts}] init_fit={init_fit:.6f}")
 
@@ -349,7 +311,6 @@ def optimize_assignment(rx_dbm: np.ndarray,
                                    N_devices=N_devices)
 
         f = fitness(dc)
-
         if PRINT_SA_PROGRESS:
             print(f"  [restart {r+1}/{restarts}] final_fit={f:.6f}")
 
@@ -364,40 +325,58 @@ def optimize_assignment(rx_dbm: np.ndarray,
 
 
 # =========================
-# Bonus: Distance-based curve
+# NEW: CDF plot (per-device success prob vs distance)
 # =========================
-def plot_success_vs_distance(distance_m: np.ndarray,
-                             schedule: Schedule,
-                             per_packet_success: np.ndarray,
-                             title: str):
+def compute_device_success_probs(n_devices: int, schedule: Schedule, per_packet_success: np.ndarray):
     """
-    For each device, estimate its success ratio (#success / #tx).
-    Then plot running average success ratio vs distance (sorted by distance).
+    Returns:
+      tx[i] = number of transmissions device i attempted
+      p[i]  = success probability for device i (only defined where tx>0)
     """
-    n = distance_m.size
-    tx = np.zeros(n, dtype=np.int32)
-    sx = np.zeros(n, dtype=np.int32)
+    tx = np.zeros(n_devices, dtype=np.int32)
+    sx = np.zeros(n_devices, dtype=np.int32)
 
     dev = schedule.dev_id
     np.add.at(tx, dev, 1)
     np.add.at(sx, dev, per_packet_success.astype(np.int32))
 
+    p = np.zeros(n_devices, dtype=float)
     mask = tx > 0
+    p[mask] = sx[mask] / tx[mask]
+    return tx, p, mask
+
+def plot_cdf_success_vs_distance(distance_m: np.ndarray,
+                                 schedule: Schedule,
+                                 per_packet_success: np.ndarray,
+                                 title: str):
+    """
+    "CDF-style" curve requested in description:
+      - x-axis: distance
+      - y-axis: cumulative fraction of devices (sorted by distance) with their per-device success probability.
+    We plot the running average success probability vs distance (smooth), and also allow a true CDF of success probs.
+    Here we do a clean CDF of per-device success probability (y) against distance (x) by sorting devices by distance.
+    """
+    n = distance_m.size
+    tx, p, mask = compute_device_success_probs(n, schedule, per_packet_success)
+
+    # Only devices that transmitted at least once in the 10k packets
     d = distance_m[mask]
-    p = sx[mask] / tx[mask]
+    p = p[mask]
 
     order = np.argsort(d)
     d = d[order]
     p = p[order]
 
-    running_avg = np.cumsum(p) / (np.arange(p.size) + 1)
+    # Running mean of per-device success probability vs distance (smooth "CDF-like" curve)
+    running_mean = np.cumsum(p) / (np.arange(p.size) + 1)
 
     plt.figure()
-    plt.plot(d, running_avg)
+    plt.plot(d, running_mean, label="Running mean success prob")
     plt.xlabel("Distance to gateway (m)")
-    plt.ylabel("Running average success probability")
+    plt.ylabel("Success probability")
     plt.title(title)
     plt.grid(True)
+    plt.legend()
 
 
 # =========================
@@ -412,11 +391,13 @@ def run():
     success_probs = {s: [] for s in scenarios}
     runtimes = {s: [] for s in scenarios}
 
-    example = None
+    # store per-packet success for CDF plot for N=CDF_PLOT_N
+    cdf_store = {}  # scenario -> (distance, schedule, per_packet_success)
+    cdf_distance = None
+    cdf_schedule = None
 
     for N in N_VALUES:
         print(f"\n=== N = {N} devices ===")
-
         rng = np.random.default_rng(rng_master.integers(0, 2**32 - 1))
 
         # Devices + RX
@@ -440,6 +421,9 @@ def run():
         print(f"baseline: success_prob={res_base.success_prob:.4f}, "
               f"success={res_base.success_count}, collisions={res_base.collision_fail_count}, "
               f"time={t1 - t0:.3f}s")
+
+        if N == CDF_PLOT_N and "baseline" in CDF_SCENARIOS:
+            cdf_store["baseline"] = (d.copy(), schedule, res_base.per_packet_success.copy())
 
         # ----- Clustering options -----
         for C in C_OPTIONS:
@@ -466,9 +450,8 @@ def run():
                   f"success={res.success_count}, collisions={res.collision_fail_count}, "
                   f"time={t1 - t0:.3f}s")
 
-            # Save one example for success vs distance curve
-            if (N == max(N_VALUES)) and (C == 2) and (example is None):
-                example = (d, schedule, res.per_packet_success, f"Success vs distance (N={N}, {label})")
+            if N == CDF_PLOT_N and label in CDF_SCENARIOS:
+                cdf_store[label] = (d.copy(), schedule, res.per_packet_success.copy())
 
     # =========================
     # Plots required by project
@@ -515,10 +498,11 @@ def run():
     plt.grid(True)
     plt.legend()
 
-    # 5) Bonus: success vs distance curve
-    if example is not None:
-        dist, sched, per_succ, ttl = example
-        plot_success_vs_distance(dist, sched, per_succ, ttl)
+    # 5) NEW: CDF-style plot(s) vs distance for selected scenarios at N=CDF_PLOT_N
+    if len(cdf_store) > 0:
+        for label, (dist, sched, per_succ) in cdf_store.items():
+            plot_cdf_success_vs_distance(dist, sched, per_succ,
+                                         title=f"CDF-style success vs distance (N={CDF_PLOT_N}, {label})")
 
     plt.show()
 
